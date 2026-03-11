@@ -23,9 +23,10 @@ from utils.preprocessing import normalize_audio
 @st.cache_data(show_spinner=False)
 def analyze_pitch_stability(y: np.ndarray, sr: int) -> dict:
     """
-    Detect unnatural pitch stability — a hallmark of synthetic speech.
-
-    Low F0 variance ⇒ suspiciously stable ⇒ possibly AI-generated.
+    Detect unnatural pitch stability AND micro-smoothness (Jitter).
+    
+    Advanced TTS can fake macro variance (high expressiveness CV),
+    but struggles to synthesize biological micro-tremors (Jitter).
     """
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
@@ -39,6 +40,8 @@ def analyze_pitch_stability(y: np.ndarray, sr: int) -> dict:
             "f0_mean": 0.0,
             "f0_std": 0.0,
             "f0_variance": 0.0,
+            "jitter": 0.0,
+            "cv": 0.0,
             "stability_score": 50,
             "verdict": "Insufficient voiced data",
             "detail": "Not enough voiced frames to analyze pitch.",
@@ -48,74 +51,99 @@ def analyze_pitch_stability(y: np.ndarray, sr: int) -> dict:
     f0_std = float(np.std(f0_voiced))
     f0_var = float(np.var(f0_voiced))
 
-    # Coefficient of variation (normalised measure)
+    # 1. Macro Variance (Expressiveness)
     cv = f0_std / f0_mean if f0_mean > 0 else 0
 
-    # Score: low CV → suspicious stability → lower score
-    if cv < 0.03:
-        stability_score = 20
-        verdict = "⚠ ANOMALOUS — Pitch is unnaturally stable (AI indicator)"
-    elif cv < 0.08:
-        stability_score = 45
-        verdict = "⚡ CAUTION — Pitch stability is below natural range"
-    elif cv < 0.20:
-        stability_score = 80
-        verdict = "✓ NORMAL — Pitch variation within human range"
+    # 2. Micro Jitter (Absolute frame-to-frame difference, normalized)
+    f0_diff = np.abs(np.diff(f0_voiced))
+    jitter = float(np.mean(f0_diff) / f0_mean) if f0_mean > 0 else 0
+
+    # Score: Low CV (Robotic) OR Low Jitter (ElevenLabs smooth) → Suspicious
+    if cv < 0.03 or jitter < 0.005:
+        stability_score = 15
+        verdict = "⚠ SYNTHETIC — Unnatural pitch smoothness (Missing biological micro-tremors)"
+    elif cv < 0.08 or jitter < 0.01:
+        stability_score = 40
+        verdict = "⚡ CAUTION — Pitch lacks organic instability"
+    elif jitter > 0.045:
+        # ElevenLabs & HiFi-GAN phase tracking glitches cause unnaturally high jitter
+        stability_score = 25
+        verdict = "⚠ VOCODER GLITCH — Severe AI phase artifacts (Unnatural high jitter)"
     else:
         stability_score = 90
-        verdict = "✓ ORGANIC — High natural pitch variation detected"
+        verdict = "✓ ORGANIC — Natural pitch variance and micro-tremors"
+
+    # Format detail string appropriately
+    if jitter > 0.045:
+        detail_txt = "Abnormally high micro-jitter points to AI vocoder phase issues."
+    elif jitter < 0.01:
+        detail_txt = "Micro-smoothness suggests AI synthesis."
+    else:
+        detail_txt = "Pitch contours show natural biological micro-tremors."
 
     return {
         "f0_mean": round(f0_mean, 2),
         "f0_std": round(f0_std, 2),
         "f0_variance": round(f0_var, 2),
-        "coefficient_of_variation": round(cv, 4),
+        "cv": round(cv, 4),
+        "jitter": round(jitter, 6),
         "stability_score": stability_score,
         "verdict": verdict,
-        "detail": (
-            f"Mean F0: {f0_mean:.1f} Hz | Std: {f0_std:.1f} Hz | "
-            f"CV: {cv:.4f}  — {'Low CV suggests synthetic origin.' if cv < 0.08 else 'CV within organic speech range.'}"
-        ),
+        "detail": f"Mean F0: {f0_mean:.1f} Hz | CV: {cv:.4f} | Jitter: {jitter:.5f} — {detail_txt}",
     }
 
 
 # ── Spectral Flatness ────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def analyze_spectral_flatness(y: np.ndarray) -> dict:
+def analyze_spectral_flatness(y: np.ndarray, sr: int) -> dict:
     """
-    Spectral flatness measures how noise-like a signal is.
-
-    High flatness → white-noise-like → possible digital aliasing / synthesis.
+    Analyze Spectral Flatness & High-Frequency Cutoffs.
+    
+    Advanced AI vocoders (like HiFi-GAN) often truncate high frequencies
+    (>8kHz) to optimize inference speed, causing an unnatural HF cliff.
     """
+    # 1. Spectral Flatness
     sf = librosa.feature.spectral_flatness(y=y)[0]
     sf_mean = float(np.mean(sf))
-    sf_std = float(np.std(sf))
-    sf_max = float(np.max(sf))
+    
+    # 2. High-Frequency Rolloff / Cutoff Analysis
+    S = np.abs(librosa.stft(y))
+    freqs = librosa.fft_frequencies(sr=sr)
+    
+    # Find ratio of energy above 8kHz vs total
+    hf_mask = freqs > 8000
+    if not np.any(hf_mask):
+        hf_ratio = 0.0  # Sample rate is too low (< 16kHz) to contain 8kHz+
+    else:
+        total_energy = np.sum(S)
+        hf_energy = np.sum(S[hf_mask, :])
+        hf_ratio = float(hf_energy / total_energy) if total_energy > 0 else 0.0
 
-    # Score: higher flatness → more suspicious
+    # Score Logic
     if sf_mean > 0.4:
+        # Typical old-school noise-like robot voice
         flatness_score = 25
-        verdict = "⚠ HIGH FLATNESS — Possible synthetic or heavily processed audio"
+        verdict = "⚠ HIGH FLATNESS — Heavily synthetic or noisy"
+    elif sr >= 22050 and hf_ratio < 0.005: 
+        # Missing highs despite high sample rate (Vocoder Wall / Cutoff artifact)
+        flatness_score = 30
+        verdict = "⚠ HF CUTOFF — Unnatural frequency wall detected (Vocoder Artifact)"
     elif sf_mean > 0.2:
-        flatness_score = 50
-        verdict = "⚡ MODERATE — Some digital processing artifacts detected"
-    elif sf_mean > 0.08:
-        flatness_score = 75
-        verdict = "✓ NORMAL — Spectral profile consistent with natural speech"
+        flatness_score = 55
+        verdict = "⚡ MODERATE — Some digital bandlimiting detected"
     else:
         flatness_score = 90
-        verdict = "✓ ORGANIC — Rich harmonic content (typical human voice)"
+        verdict = "✓ ORGANIC — Rich harmonic content & natural rolloff"
 
     return {
         "mean_flatness": round(sf_mean, 4),
-        "std_flatness": round(sf_std, 4),
-        "max_flatness": round(sf_max, 4),
+        "hf_energy_ratio": round(hf_ratio, 5),
         "flatness_score": flatness_score,
         "verdict": verdict,
         "detail": (
-            f"Mean spectral flatness: {sf_mean:.4f} | "
-            f"{'High flatness indicates noise-like spectrum.' if sf_mean > 0.2 else 'Harmonic-rich spectrum is typical of natural speech.'}"
+            f"Flatness: {sf_mean:.4f} | HF>8kHz: {hf_ratio:.2%} — "
+            f"{'Sharp HF cutoff indicates neural vocoding.' if (sr >= 22050 and hf_ratio < 0.005) else 'Harmonics consistent with analog mic.'}"
         ),
     }
 
@@ -125,51 +153,69 @@ def analyze_spectral_flatness(y: np.ndarray) -> dict:
 @st.cache_data(show_spinner=False)
 def analyze_rms_dynamics(y: np.ndarray, sr: int) -> dict:
     """
-    Analyze RMS energy for natural breathing patterns and organic pauses.
-
-    Natural speech has dynamic range with quiet gaps; synthetic speech
-    tends to have more uniform energy distribution.
+    Analyze RMS energy for natural breathing patterns, organic pauses,
+    and absolute Digital Silence.
+    
+    True analog recordings always have an analog noise floor > 0.
+    100% digital zero RMS strongly flags synthetic audio.
     """
     rms = librosa.feature.rms(y=y)[0]
     rms_mean = float(np.mean(rms))
-    rms_std = float(np.std(rms))
     rms_max = float(np.max(rms))
     rms_min = float(np.min(rms))
 
-    # Dynamic range ratio
+    # 1. Dynamic range ratio
     dynamic_range = rms_max / rms_mean if rms_mean > 0 else 0
 
-    # Count "silent" frames (< 10% of mean energy) → proxy for pauses / breathing
+    # 2. Digital Silence (Absolute Zero) Check
+    # If the minimum RMS is mathematically identically zero (or near 1e-6)
+    digital_silence_present = bool(rms_min < 1e-5)
+
+    # 3. Macro Silence Ratio (Breaths)
     silence_threshold = rms_mean * 0.1
     silent_frames = int(np.sum(rms < silence_threshold))
     total_frames = len(rms)
     silence_ratio = silent_frames / total_frames if total_frames > 0 else 0
 
     # Score heuristic
-    if dynamic_range < 1.5 and silence_ratio < 0.05:
-        rms_score = 25
-        verdict = "⚠ FLAT ENERGY — No natural pauses detected (AI indicator)"
-    elif dynamic_range < 2.5:
-        rms_score = 50
-        verdict = "⚡ LOW DYNAMICS — Minimal breathing patterns found"
-    elif silence_ratio > 0.15:
-        rms_score = 85
-        verdict = "✓ ORGANIC — Natural breathing and pauses present"
+    # If Digital Silence exists BUT it's highly dynamic (>4.5x), it's likely a hardware noise gate.
+    # Only penalize Digital Silence if it accompanies hyper-compression.
+    if digital_silence_present and dynamic_range < 4.5:
+        rms_score = 10
+        verdict = "⚠ SYNTHETIC COMPRESSION — Math zero gaps + Broadcast normalization"
+    elif dynamic_range < 4.5:
+        rms_score = 30
+        verdict = "⚠ HYPER-COMPRESSED — Unnatural dynamics (AI Broadcast normalization flag)"
+    elif dynamic_range < 6.0 and silence_ratio < 0.05:
+        rms_score = 40
+        verdict = "⚡ FLAT ENERGY — Minimal breathing patterns / Heavily compressed"
+    elif silence_ratio > 0.30:
+        rms_score = 65
+        verdict = "⚡ HIGH SILENCE — Spliced or unusually sparse speech"
     else:
-        rms_score = 70
-        verdict = "✓ NORMAL — Reasonable energy dynamics"
+        # If it reaches here, it has healthy dynamic range (>4.5) and normal breathing
+        rms_score = 90
+        verdict = "✓ ORGANIC — Natural breathing and dynamic range present"
+
+    # Format detail string appropriately
+    if digital_silence_present and dynamic_range < 4.5:
+        detail_txt = "Mathematical zero gap accompanied by hyper-compression proves AI generation."
+    elif digital_silence_present:
+        detail_txt = "Analog amplitude dynamics detected (mathematical zeros ignored due to presumed noise-gate)."
+    elif dynamic_range < 4.5:
+        detail_txt = "Broadcast-style hyper-compression typical of Gen-AI."
+    else:
+        detail_txt = "Healthy amplitude dynamics confirm human mic origin."
 
     return {
         "rms_mean": round(rms_mean, 6),
-        "rms_std": round(rms_std, 6),
+        "min_amplitude": round(rms_min, 6),
         "dynamic_range": round(dynamic_range, 2),
         "silence_ratio": round(silence_ratio, 4),
+        "digital_silence": digital_silence_present,
         "rms_score": rms_score,
         "verdict": verdict,
-        "detail": (
-            f"Dynamic range: {dynamic_range:.2f}x | Silence ratio: {silence_ratio:.1%} | "
-            f"{'Lack of pauses is atypical for human speech.' if silence_ratio < 0.05 else 'Pause patterns are consistent with natural speech.'}"
-        ),
+        "detail": f"Dyn Range: {dynamic_range:.1f}x | Sil Ratio: {silence_ratio:.1%} | {detail_txt}",
     }
 
 
@@ -262,23 +308,28 @@ def run_audio_forensics(audio_bytes: bytes, file_name: str) -> dict:
 
     # Run analyses
     pitch = analyze_pitch_stability(y, sr)
-    spectral = analyze_spectral_flatness(y)
+    spectral = analyze_spectral_flatness(y, sr)
     rms = analyze_rms_dynamics(y, sr)
     spec_fig = generate_mel_spectrogram(y, sr)
 
     # Composite authenticity score (weighted average)
     authenticity = int(
         pitch["stability_score"] * 0.40
-        + spectral["flatness_score"] * 0.30
-        + rms["rms_score"] * 0.30
+        + spectral["flatness_score"] * 0.35
+        + rms["rms_score"] * 0.25
     )
+
+    # Hard Logic Capping: If any core metric strongly detects synthetic traits, cap the entire score
+    # This prevents highly expressive AI (like ElevenLabs) from using 1 strong metric to float the average
+    if pitch["stability_score"] <= 40 or spectral["flatness_score"] <= 40 or rms["rms_score"] <= 40:
+        authenticity = min(authenticity, 44)
 
     if authenticity >= 75:
         overall_verdict = "✓ LIKELY AUTHENTIC — Forensic indicators within organic range"
     elif authenticity >= 45:
-        overall_verdict = "⚡ INCONCLUSIVE — Some anomalies detected; manual review recommended"
+        overall_verdict = "⚡ INCONCLUSIVE — Advanced Gen-AI suspects detected"
     else:
-        overall_verdict = "⚠ SUSPICIOUS — Multiple synthetic indicators flagged"
+        overall_verdict = "⚠ SYNTHETIC — Mathematical vocoder signatures flagged"
 
     return {
         "pitch": pitch,

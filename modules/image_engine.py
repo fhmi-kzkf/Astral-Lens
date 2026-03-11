@@ -22,6 +22,11 @@ AI_GENERATOR_SIGNATURES = [
     "bing image creator", "copilot", "imagen", "flux",
 ]
 
+ORGANIC_SIGNATURES = [
+    "windows", "apple", "android", "samsung", "huawei", "xiaomi", 
+    "oppo", "vivo", "motorola", "mediatek", "google", "oneplus"
+]
+
 
 def _extract_exif(image: Image.Image) -> dict:
     """Extract human-readable EXIF data from a PIL Image."""
@@ -38,6 +43,11 @@ def _extract_exif(image: Image.Image) -> dict:
                 value = value.decode("utf-8", errors="replace")
             except Exception:
                 value = str(value)
+        
+        # Sanitize string of trailing null bytes (\x00) inserted by cheap camera firmwares
+        if isinstance(value, str):
+            value = value.replace("\x00", "").strip()
+            
         readable[tag_name] = str(value)
 
     return readable
@@ -79,19 +89,25 @@ def _check_editing(exif: dict) -> dict:
     processing = exif.get("ImageProcessingSoftware", exif.get("ProcessingSoftware", "")).lower()
     combined = software + " " + processing
 
-    # Check for editor signatures
+    # Check for signatures
     editors_found = [sig for sig in EDITOR_SIGNATURES if sig in combined]
     ai_found = [sig for sig in AI_GENERATOR_SIGNATURES if sig in combined]
+    organic_found = [sig for sig in ORGANIC_SIGNATURES if sig in combined]
 
+    # AI is absolute priority
     if ai_found:
         verdict = f"⚠ AI GENERATOR DETECTED — {', '.join(ai_found).upper()}"
         score = 10
     elif editors_found:
         verdict = f"⚡ EDITING SOFTWARE — {', '.join(editors_found).upper()}"
         score = 40
+    elif organic_found:
+        # Standard OS or Mobile handler (e.g. Windows, MediaTek, Samsung)
+        verdict = f"✓ ORGANIC HANDLER — {', '.join(organic_found).capitalize()}"
+        score = 90
     elif software:
         verdict = f"Software: {software}"
-        score = 70
+        score = 60 # Unrecognized software, slight suspicion but not necessarily an editor
     else:
         verdict = "No software metadata found"
         score = 50  # Neutral — could be stripped
@@ -99,7 +115,8 @@ def _check_editing(exif: dict) -> dict:
     return {
         "editors_detected": editors_found,
         "ai_generators_detected": ai_found,
-        "software_tag": exif.get("Software", "N/A"),
+        "organic_handlers_detected": organic_found,
+        "software_tag": exif.get("Software", "N/A").replace("\x00", "").strip(),
         "score": score,
         "verdict": verdict,
     }
@@ -116,19 +133,26 @@ def _assess_metadata_completeness(exif: dict) -> dict:
         "FocalLength", "Flash", "WhiteBalance",
     ]
     present = [f for f in key_fields if f in exif]
-    completeness = len(present) / len(key_fields) * 100
+    
+    # Many smartphones only save 3-5 fields. We shouldn't punish them for missing 'Flash'.
+    num_fields = len(present)
 
-    if completeness >= 70:
+    if num_fields >= 3:
+        # 3+ fields (e.g., Make, Model, DateTime) implies standard smartphone config
+        completeness = min(100.0, (num_fields / 4.0) * 100) 
         verdict = "✓ RICH METADATA — Consistent with authentic camera capture"
         risk = "Low"
-    elif completeness >= 30:
+    elif num_fields == 2:
+        completeness = 50.0
         verdict = "⚡ PARTIAL METADATA — Some fields stripped or missing"
         risk = "Medium"
-    elif completeness > 0:
+    elif num_fields == 1:
+        completeness = 25.0
         verdict = "⚠ SPARSE METADATA — Most camera fields are absent"
         risk = "High"
     else:
-        verdict = "⚠ NO METADATA — Highly suspicious, possibly AI-generated or heavily processed"
+        completeness = 0.0
+        verdict = "⚠ NO METADATA — Fields stripped (Social Media transfer) or heavily processed"
         risk = "High"
 
     return {
@@ -175,14 +199,26 @@ def run_image_forensics(image_bytes: bytes, file_name: str) -> dict:
         + cam_score * 0.15
         + gps_score * 0.15
     )
-    authenticity = min(authenticity, 100)
+    
+    # ── HARD LOGIC CAPPING ──
+    # 1. AI Generative Kill-Switch
+    if editing["score"] <= 10 or len(editing.get("ai_generators_detected", [])) > 0:
+        authenticity = 10
+    
+    # 2. Stripped Metadata Buffer (Social media screenshots)
+    # If there's truly NO metadata, but we also DID NOT explicitly find AI editors, 
+    # it shouldn't score an abysmal 21. It should sit near 45 (Inconclusive) because it's just blank.
+    elif completeness["completeness_pct"] == 0.0 and authenticity < 45:
+        authenticity = 45
+        
+    authenticity = min(max(authenticity, 0), 100)
 
     if authenticity >= 70:
-        overall = "✓ LIKELY AUTHENTIC — Metadata consistent with genuine camera capture"
-    elif authenticity >= 40:
-        overall = "⚡ INCONCLUSIVE — Partial metadata; manual review recommended"
+        overall = "✓ LIKELY AUTHENTIC — Metadata consistent with genuine physical capture"
+    elif authenticity > 40:
+        overall = "⚡ INCONCLUSIVE — Metadata is partially stripped, modified, or saved via App"
     else:
-        overall = "⚠ SUSPICIOUS — Metadata profile indicates possible forgery or AI generation"
+        overall = "⚠ SUSPICIOUS — Severe metadata discrepancies or explicit Generative AI signatures flagged"
 
     # Risk level
     if authenticity >= 70:
