@@ -4,10 +4,13 @@ Gemini 2.5 Flash-based multi-layered analysis:
   • Reality Index (credibility scoring)
   • Affective Signal Analysis (emotion detection)
   • Malicious Pattern Recognition (scam detection)
+  • URL OSINT Scanner (phishing / suspicious link detection)
 """
 
 import json
 import re
+import hashlib
+from urllib.parse import urlparse
 
 import google.generativeai as genai
 
@@ -30,6 +33,20 @@ SCAM_PATTERNS = [
     (r"wire\s+transfer", "Wire transfer request"),
     (r"send\s+(money|funds|payment)\s+(to|via)", "Send money request"),
     (r"whatsapp.*\+\d{10,}", "WhatsApp number solicitation"),
+]
+
+
+# ── Suspicious URL Patterns ──────────────────────────────────────────────────
+
+SUSPICIOUS_TLD = [
+    ".xyz", ".top", ".club", ".buzz", ".work", ".loan",
+    ".click", ".link", ".info", ".tk", ".ml", ".ga", ".cf",
+]
+
+PHISHING_KEYWORDS = [
+    "secure-login", "update-account", "verify-identity", "confirm-payment",
+    "wallet-connect", "free-prize", "claim-reward", "bit.ly", "tinyurl",
+    "signin", "log-in", "account-verify", "password-reset",
 ]
 
 
@@ -61,6 +78,23 @@ def _parse_json_response(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         return {"error": "Failed to parse AI response", "raw": text}
+
+
+def _themed_error(stage: str, e: Exception) -> str:
+    """Return a Cyber-Noir styled error message instead of raw traceback."""
+    err_type = type(e).__name__
+    if "429" in str(e) or "ResourceExhausted" in err_type:
+        return (f"⚠ SIGNAL LOST — Rate limit exceeded on {stage}. "
+                "Mainframe cooling down. Retry in 60 seconds.")
+    elif "APIError" in err_type or "GoogleAPIError" in err_type:
+        return (f"⚠ CRITICAL FAILURE — {stage} mainframe disconnected. "
+                f"Error: {err_type}")
+    elif "Timeout" in err_type or "timeout" in str(e).lower():
+        return (f"⚠ CONNECTION TIMEOUT — {stage} uplink severed. "
+                "Check network and retry.")
+    else:
+        return (f"⚠ SYSTEM MALFUNCTION — {stage} encountered an anomaly: "
+                f"{err_type}: {str(e)[:120]}")
 
 
 # ── Reality Index ─────────────────────────────────────────────────────────────
@@ -97,7 +131,7 @@ Scoring:
         return {
             "reality_score": -1,
             "risk_level": "Error",
-            "explanation": f"Analysis failed: {str(e)}",
+            "explanation": _themed_error("Reality Index", e),
         }
 
 
@@ -131,7 +165,7 @@ Return a JSON object matching exactly this schema:
             "emotions": {"fear": 0, "anger": 0, "trust": 0, "neutral": 100},
             "manipulation_warning": False,
             "dominant_emotion": "neutral",
-            "analysis": f"Analysis failed: {str(e)}",
+            "analysis": _themed_error("Affective Signal", e),
         }
 
 
@@ -176,7 +210,7 @@ Return a JSON object matching exactly this schema:
     except Exception as e:
         semantic = {
             "semantic_scam_score": 0,
-            "hidden_intent": f"Analysis failed: {str(e)}",
+            "hidden_intent": _themed_error("Scam Detection", e),
             "urgency_tactics": "N/A",
             "deceptive_patterns": "N/A",
             "verdict": "ERROR",
@@ -194,17 +228,101 @@ Return a JSON object matching exactly this schema:
     }
 
 
+# ── URL OSINT Scanner ────────────────────────────────────────────────────────
+
+def extract_urls(text: str) -> list[str]:
+    """Extract all URLs from the raw (uncleaned) input text."""
+    url_pattern = re.compile(
+        r'https?://[^\s<>"\')]+|www\.[^\s<>"\')]+',
+        re.IGNORECASE,
+    )
+    return url_pattern.findall(text)
+
+
+def analyze_urls(urls: list[str]) -> dict:
+    """
+    Perform heuristic OSINT analysis on extracted URLs.
+
+    Returns dict with keys:
+      total_urls, flagged_urls (list), risk_score (0-100), verdict
+    """
+    if not urls:
+        return {
+            "total_urls": 0,
+            "flagged_urls": [],
+            "risk_score": 0,
+            "verdict": "CLEAN — No URLs detected in input.",
+        }
+
+    flagged = []
+    for url in urls:
+        reasons = []
+        parsed = urlparse(url if url.startswith("http") else f"http://{url}")
+        domain = parsed.netloc.lower()
+
+        # Check suspicious TLDs
+        for tld in SUSPICIOUS_TLD:
+            if domain.endswith(tld):
+                reasons.append(f"Suspicious TLD: {tld}")
+                break
+
+        # Check phishing keywords in domain
+        for kw in PHISHING_KEYWORDS:
+            if kw in domain or kw in parsed.path.lower():
+                reasons.append(f"Phishing keyword: {kw}")
+                break
+
+        # Excessively long subdomain chains
+        subdomains = domain.split(".")
+        if len(subdomains) > 4:
+            reasons.append(f"Excessive subdomains ({len(subdomains)} levels)")
+
+        # IP address instead of domain
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', domain):
+            reasons.append("IP address used instead of domain name")
+
+        if reasons:
+            flagged.append({"url": url, "flags": reasons})
+
+    risk_score = min(int(len(flagged) / len(urls) * 100), 100) if urls else 0
+
+    if risk_score >= 60:
+        verdict = "⚠ HIGH RISK — Multiple suspicious URLs detected"
+    elif risk_score > 0:
+        verdict = "⚡ CAUTION — Some URLs exhibit suspicious characteristics"
+    else:
+        verdict = "✓ CLEAN — No obviously suspicious URL patterns found"
+
+    return {
+        "total_urls": len(urls),
+        "flagged_urls": flagged,
+        "risk_score": risk_score,
+        "verdict": verdict,
+    }
+
+
 # ── Full Analysis Orchestrator ───────────────────────────────────────────────
 
-def run_full_analysis(text: str, api_key: str) -> dict:
+def run_full_analysis(text: str, api_key: str, raw_text: str = "") -> dict:
     """
-    Run all three analyses and cross-reference results.
+    Run all analyses and cross-reference results.
 
-    Scam detection can lower the Reality Index.
+    Parameters
+    ----------
+    text : str
+        Cleaned text for AI analysis.
+    api_key : str
+        Gemini API key.
+    raw_text : str
+        Original uncleaned text (used for URL extraction).
     """
     reality = analyze_reality_index(text, api_key)
     emotions = analyze_emotions(text, api_key)
     scam = detect_scam(text, api_key)
+
+    # URL OSINT on the RAW text (before URLs were stripped)
+    urls = extract_urls(raw_text or text)
+    url_osint = analyze_urls(urls)
 
     # Cross-reference: high scam score reduces reality index
     if scam.get("scam_score", 0) >= 60:
@@ -216,6 +334,14 @@ def run_full_analysis(text: str, api_key: str) -> dict:
             f"[SCAM PENALTY APPLIED: -{penalty} pts] "
             + reality.get("explanation", "")
         )
+
+    # URL risk also affects scam score
+    if url_osint["risk_score"] >= 60:
+        url_penalty = int(url_osint["risk_score"] * 0.25)
+        original = reality.get("reality_score", 50)
+        reality["reality_score"] = max(0, original - url_penalty)
+        if reality.get("risk_level") == "Low":
+            reality["risk_level"] = "Medium"
 
     # Emotional manipulation also affects credibility
     fear = emotions.get("emotions", {}).get("fear", 0)
@@ -231,4 +357,5 @@ def run_full_analysis(text: str, api_key: str) -> dict:
         "reality_index": reality,
         "affective_signals": emotions,
         "scam_detection": scam,
+        "url_osint": url_osint,
     }

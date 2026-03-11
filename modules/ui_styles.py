@@ -370,38 +370,8 @@ def render_header():
 
 
 def render_sidebar():
-    """Render the sidebar branding and API key input."""
-    with st.sidebar:
-        st.markdown(
-            """
-            <div style="text-align:center; padding:16px 0;">
-                <p style="font-family:'Share Tech Mono',monospace;
-                          font-size:1.1rem; color:#3b82f6;
-                          text-shadow:0 0 15px rgba(59,130,246,0.4);
-                          letter-spacing:3px; margin:0;">
-                    ⟐ ASTRAL-LENS
-                </p>
-                <p style="font-size:0.6rem; color:#737373;
-                          letter-spacing:2px; text-transform:uppercase;">
-                    v1.0 · forensic engine
-                </p>
-            </div>
-            <div class="neon-divider"></div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            """
-            <div style="padding:8px 0; font-size:0.7rem; color:#737373;
-                        font-family:'Roboto Mono',monospace;">
-                <p>▸ <span style="color:#3b82f6;">SIGNAL SCAN</span> — Text Forensics</p>
-                <p>▸ <span style="color:#3b82f6;">FREQ SCAN</span> — Audio Forensics</p>
-                <p>▸ <span style="color:#3b82f6;">AWARENESS</span> — Education Hub</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    """Sidebar is now rendered directly in app.py with the Security Dashboard."""
+    pass
 
 
 def noir_card(title: str, content: str):
